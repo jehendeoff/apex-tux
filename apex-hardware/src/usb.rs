@@ -1,11 +1,14 @@
 use crate::{device::FrameBuffer, Device};
 use anyhow::{anyhow, Context, Result};
+#[cfg(all(feature = "experimental-openrgb-support", not(feature = "usb")))]
+use apex_hidapi_default::{HidApi, HidDevice};
+#[cfg(all(feature = "usb", not(feature = "experimental-openrgb-support")))]
+use apex_hidapi_static::{HidApi, HidDevice};
 use embedded_graphics::{
     pixelcolor::BinaryColor,
     prelude::*,
     primitives::{PrimitiveStyleBuilder, Rectangle, StyledDrawable},
 };
-use hidapi::{HidApi, HidDevice};
 use num_enum::TryFromPrimitive;
 
 /// The SteelSeries vendor ID used to identify the USB devices
