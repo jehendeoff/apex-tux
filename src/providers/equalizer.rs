@@ -6,24 +6,21 @@ use anyhow::{anyhow, Context, Result};
 use apex_hardware::FrameBuffer;
 use async_stream::try_stream;
 use config::Config;
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    Device, FromSample, Sample, SampleFormat, SizedSample, Stream, SupportedStreamConfig,
+};
 use embedded_graphics::{
     geometry::Point,
     pixelcolor::BinaryColor,
     primitives::{Primitive, PrimitiveStyle, Rectangle},
     Drawable,
 };
-use futures::Stream;
+use futures::Stream as FuturesStream;
 use linkme::distributed_slice;
 use log::{info, warn};
-use pipewire as pw;
-use pw::{properties::properties, spa};
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
-use std::os::unix::net::UnixStream; //Pipewire detection
 use std::{
-    convert::TryInto,
-    env, //Pipewire detection
-    mem::size_of,
-    path::PathBuf, //Pipewire detection
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc, Arc,
@@ -31,10 +28,9 @@ use std::{
     thread,
     time::Duration,
 };
-use tokio::{time, time::MissedTickBehavior}; //Pipewire detection
+use tokio::{time, time::MissedTickBehavior};
 
-const FFT_SIZE: usize = 2048; //FFT : Fast Fourier Transform
-const DEFAULT_SAMPLE_RATE: u32 = 48_000;
+const FFT_SIZE: usize = 2048;
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const DISPLAY_WIDTH: usize = 128;
 const DISPLAY_HEIGHT: i32 = 40;
@@ -54,7 +50,14 @@ struct EqualizerConfig {
     rise_smoothing: f32,
     fall_smoothing: f32,
     capture_sink: bool,
-    target_object: Option<String>,
+    device_name: Option<String>,
+}
+
+struct CaptureDeviceSelection {
+    device: Device,
+    supported_config: SupportedStreamConfig,
+    device_name: String,
+    loopback: bool,
 }
 
 #[derive(Debug)]
@@ -81,8 +84,6 @@ impl SharedSpectrum {
 #[allow(clippy::unnecessary_wraps)]
 fn register_callback(config: &Config) -> Result<Box<dyn ContentWrapper>> {
     info!("Registering Equalizer display source.");
-    // fail early if PipeWire is not available
-    ensure_pipewire_available()?;
 
     let min_frequency = config
         .get_float("equalizer.min_frequency")
@@ -90,6 +91,18 @@ fn register_callback(config: &Config) -> Result<Box<dyn ContentWrapper>> {
         .clamp(20.0, 20_000.0) as f32;
 
     let min_db = config.get_float("equalizer.min_db").unwrap_or(-72.0) as f32;
+
+    let device_name = config
+        .get_str("equalizer.device_name")
+        .ok()
+        .or_else(|| config.get_str("equalizer.target_object").ok());
+
+    if config.get_bool("equalizer.capture_sink").unwrap_or(true) {
+        info!(
+            "CPAL equalizer depends on the OS exposing a loopback-capable input device; choose \
+             one with equalizer.device_name when needed."
+        );
+    }
 
     let config = EqualizerConfig {
         polling_interval: config
@@ -120,34 +133,17 @@ fn register_callback(config: &Config) -> Result<Box<dyn ContentWrapper>> {
             .unwrap_or(0.4)
             .clamp(0.01, 1.0) as f32,
         capture_sink: config.get_bool("equalizer.capture_sink").unwrap_or(true),
-        target_object: config.get_str("equalizer.target_object").ok(),
+        device_name,
     };
 
-    // shared state between capture and render
     let shared = SharedSpectrum::new(config.bar_count);
     start_capture(shared.clone(), config.clone())?;
 
     Ok(Box::new(Equalizer {
         polling_interval: config.polling_interval,
         bar_count: config.bar_count,
-        shared: shared,
+        shared,
     }))
-}
-fn ensure_pipewire_available() -> Result<()> {
-    // PipeWire runtime socket lives under XDG_RUNTIME_DIR
-    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
-        .ok_or_else(|| anyhow!("PipeWire equalizer needs a running PipeWire session"))?;
-    let socket_path = PathBuf::from(runtime_dir).join("pipewire-0");
-
-    // a socket connect is enough to check the session
-    UnixStream::connect(&socket_path).map_err(|_| {
-        anyhow!(
-            "PipeWire equalizer needs a running PipeWire session (missing {})",
-            socket_path.display()
-        )
-    })?;
-
-    Ok(())
 }
 
 fn start_capture(shared: Arc<SharedSpectrum>, config: EqualizerConfig) -> Result<()> {
@@ -156,27 +152,23 @@ fn start_capture(shared: Arc<SharedSpectrum>, config: EqualizerConfig) -> Result
     thread::Builder::new()
         .name("apex-tux-equalizer".to_string())
         .spawn(move || {
-            // keep PipeWire on its own thread so audio work does not block rendering
             if let Err(error) = run_capture_thread(shared, config, ready_tx.clone()) {
                 let message = error.to_string();
                 let _ = ready_tx.send(Err(message.clone()));
                 warn!("Equalizer capture stopped: {message}");
             }
         })
-        .context("Failed to spawn the PipeWire equalizer thread")?;
+        .context("Failed to spawn the CPAL equalizer thread")?;
 
     match ready_rx.recv_timeout(READY_TIMEOUT) {
         Ok(Ok(())) => Ok(()),
-        // bubble up capture errors
         Ok(Err(message)) => Err(anyhow!(message)),
-        // don't hang forever on startup
         Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow!(
-            "Timed out after {}s while waiting for PipeWire audio capture to start",
+            "Timed out after {}s while waiting for CPAL audio capture to start",
             READY_TIMEOUT.as_secs()
         )),
-        // thread died
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow!(
-            "PipeWire equalizer thread exited before initialization"
+            "CPAL equalizer thread exited before initialization"
         )),
     }
 }
@@ -186,151 +178,346 @@ fn run_capture_thread(
     config: EqualizerConfig,
     ready_tx: mpsc::SyncSender<Result<(), String>>,
 ) -> Result<()> {
-    // PipeWire wants global init first
-    pw::init();
+    let selection = select_capture_device(&config)?;
+    let stream_config = selection.supported_config.config();
 
-    let mainloop = pw::main_loop::MainLoopRc::new(None)?;
-    let context = pw::context::ContextRc::new(&mainloop, None)?;
-    let core = context.connect_rc(None)?;
+    info!(
+        "Using CPAL equalizer {} device: {} ({} ch @ {} Hz, {:?})",
+        if selection.loopback {
+            "loopback"
+        } else {
+            "input"
+        },
+        selection.device_name,
+        stream_config.channels,
+        stream_config.sample_rate.0,
+        selection.supported_config.sample_format()
+    );
 
-    // tell PipeWire this is audio capture
-    let mut props = properties! {
-        *pw::keys::APP_NAME => "apex-tux",
-        *pw::keys::MEDIA_TYPE => "Audio",
-        *pw::keys::MEDIA_CATEGORY => "Capture",
-        *pw::keys::MEDIA_ROLE => "DSP",
-        *pw::keys::NODE_LATENCY => "1024/48000",
-    };
-
-    if config.capture_sink {
-        props.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
-    }
-    if let Some(target_object) = config.target_object.as_deref() {
-        // allow routing to a specific node
-        props.insert("target.object", target_object);
-    }
-
-    // this stream feeds the FFT pipeline
-    let stream = pw::stream::StreamBox::new(&core, "apex-tux-equalizer", props)?;
-    let _listener = stream
-        .add_local_listener_with_user_data(CaptureState::new(shared, &config))
-        .process(|stream, user_data| {
-            // no buffer, no work
-            let Some(mut buffer) = stream.dequeue_buffer() else {
-                return;
-            };
-            let datas = buffer.datas_mut();
-            if datas.is_empty() {
-                return;
-            }
-
-            let data = &mut datas[0];
-            // ignore empty chunks
-            if data.chunk().size() == 0 {
-                return;
-            }
-
-            // interleaved f32 audio
-            let channels = user_data.format.channels().max(1) as usize;
-            let sample_size = size_of::<f32>();
-            let frame_bytes = channels.saturating_mul(sample_size);
-            let chunk_size = data.chunk().size() as usize;
-            if frame_bytes == 0 {
-                return;
-            }
-
-            if let Some(bytes) = data.data() {
-                // trim to whole frames
-                let byte_count = chunk_size.min(bytes.len());
-                let aligned_count = byte_count - (byte_count % frame_bytes);
-                if aligned_count == 0 {
-                    return;
-                }
-                // collapse frames to mono before the FFT
-                user_data.push_samples(&bytes[..aligned_count]);
-                user_data.analyze();
-            }
-        })
-        .param_changed(|_, user_data, id, param| {
-            // only care about format changes
-            let Some(param) = param else {
-                return;
-            };
-            if id != spa::param::ParamType::Format.as_raw() {
-                return;
-            }
-
-            // parse the PipeWire format payload
-            let Ok((media_type, media_subtype)) = spa::param::format_utils::parse_format(param)
-            else {
-                return;
-            };
-
-            if media_type != spa::param::format::MediaType::Audio
-                || media_subtype != spa::param::format::MediaSubtype::Raw
-            {
-                return;
-            }
-
-            // rebuild bands when the rate changes
-            if user_data.format.parse(param).is_ok() {
-                user_data.rebuild_bands(user_data.format.rate());
-            }
-        })
-        .register()?;
-
-    // build the requested sample format
-    let values = build_capture_params()?;
-    let pod = spa::pod::Pod::from_bytes(&values).context("Failed to build PipeWire pod")?;
-    let mut params = [pod];
-
-    // connect as an input stream
-    stream.connect(
-        spa::utils::Direction::Input,
-        None,
-        pw::stream::StreamFlags::AUTOCONNECT
-            | pw::stream::StreamFlags::MAP_BUFFERS
-            | pw::stream::StreamFlags::RT_PROCESS,
-        &mut params,
+    let state = CaptureState::new(
+        shared,
+        &config,
+        stream_config.sample_rate.0,
+        stream_config.channels as usize,
+    );
+    let stream = build_input_stream(
+        &selection.device,
+        &selection.supported_config,
+        state,
+        &selection.device_name,
+        selection.loopback,
     )?;
+    stream
+        .play()
+        .context("Failed to start the CPAL equalizer input stream")?;
 
-    // signal readiness once connected
     ready_tx
         .send(Ok(()))
-        .map_err(|_| anyhow!("Failed to report PipeWire equalizer readiness"))?;
+        .map_err(|_| anyhow!("Failed to report CPAL equalizer readiness"))?;
 
-    // keep the thread alive while the stream runs
-    mainloop.run();
-    Ok(())
+    loop {
+        let _keep_stream_alive = &stream;
+        thread::park_timeout(Duration::from_secs(60));
+    }
 }
 
-fn build_capture_params() -> Result<Vec<u8>> {
-    // request 32-bit float PCM
-    let mut audio_info = spa::param::audio::AudioInfoRaw::new();
-    audio_info.set_format(spa::param::audio::AudioFormat::F32LE);
+fn select_capture_device(config: &EqualizerConfig) -> Result<CaptureDeviceSelection> {
+    #[cfg(target_os = "windows")]
+    if config.capture_sink {
+        return select_output_loopback_device(config.device_name.as_deref());
+    }
 
-    // wrap the audio format in a PipeWire object
-    let obj = spa::pod::Object {
-        type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
-        id: spa::param::ParamType::EnumFormat.as_raw(),
-        properties: audio_info.into(),
-    };
+    select_input_device(config.device_name.as_deref())
+}
 
-    // serialize the pod payload
-    let values = spa::pod::serialize::PodSerializer::serialize(
-        std::io::Cursor::new(Vec::new()),
-        &spa::pod::Value::Object(obj),
-    )
-    .context("Failed to serialize PipeWire audio format")?
-    .0
-    .into_inner();
+fn select_input_device(preferred_name: Option<&str>) -> Result<CaptureDeviceSelection> {
+    let host = cpal::default_host();
 
-    Ok(values)
+    if let Some(preferred_name) = preferred_name {
+        let needle = preferred_name.trim().to_ascii_lowercase();
+        let mut available = Vec::new();
+
+        for device in host.devices().context("Failed to enumerate CPAL devices")? {
+            if !device_supports_input(&device) {
+                continue;
+            }
+
+            let device_name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
+            available.push(device_name.clone());
+
+            if device_name.eq_ignore_ascii_case(preferred_name)
+                || device_name.to_ascii_lowercase().contains(&needle)
+            {
+                return build_input_selection(device);
+            }
+        }
+
+        return Err(anyhow!(
+            "No CPAL input device matched {:?}. Available input devices: \n\t{}",
+            preferred_name,
+            if available.is_empty() {
+                "<none>".to_string()
+            } else {
+                available.join("\n\t ")
+            }
+        ));
+    }
+
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| anyhow!("No default CPAL input device available"))?;
+    build_input_selection(device)
+}
+
+fn device_supports_input(device: &Device) -> bool {
+    if device.default_input_config().is_ok() {
+        return true;
+    }
+
+    device
+        .supported_input_configs()
+        .map(|mut configs| configs.next().is_some())
+        .unwrap_or(false)
+}
+
+fn build_input_selection(device: Device) -> Result<CaptureDeviceSelection> {
+    let device_name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
+    let supported_config = select_input_config(&device)?;
+    Ok(CaptureDeviceSelection {
+        device,
+        supported_config,
+        device_name,
+        loopback: false,
+    })
+}
+
+fn select_input_config(device: &Device) -> Result<SupportedStreamConfig> {
+    if let Ok(config) = device.default_input_config() {
+        return Ok(config);
+    }
+
+    device
+        .supported_input_configs()
+        .context("Failed to query supported input configs")?
+        .next()
+        .map(|config| config.with_max_sample_rate())
+        .ok_or_else(|| anyhow!("The selected CPAL input device has no supported input configs"))
+}
+
+#[cfg(target_os = "windows")]
+fn select_output_loopback_device(preferred_name: Option<&str>) -> Result<CaptureDeviceSelection> {
+    let host = cpal::default_host();
+
+    if let Some(preferred_name) = preferred_name {
+        let needle = preferred_name.trim().to_ascii_lowercase();
+        let mut available = Vec::new();
+
+        for device in host.devices().context("Failed to enumerate CPAL devices")? {
+            if !device_supports_output(&device) {
+                continue;
+            }
+
+            let device_name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
+            available.push(device_name.clone());
+
+            if device_name.eq_ignore_ascii_case(preferred_name)
+                || device_name.to_ascii_lowercase().contains(&needle)
+            {
+                return build_output_loopback_selection(device);
+            }
+        }
+
+        return Err(anyhow!(
+            "No CPAL output device matched {:?} for loopback capture. Available output devices: \
+             \n\t{}",
+            preferred_name,
+            if available.is_empty() {
+                "<none>".to_string()
+            } else {
+                available.join("\n\t ")
+            }
+        ));
+    }
+
+    let device = host
+        .default_output_device()
+        .ok_or_else(|| anyhow!("No default CPAL output device available for loopback capture"))?;
+    build_output_loopback_selection(device)
+}
+
+#[cfg(target_os = "windows")]
+fn device_supports_output(device: &Device) -> bool {
+    if device.default_output_config().is_ok() {
+        return true;
+    }
+
+    device
+        .supported_output_configs()
+        .map(|mut configs| configs.next().is_some())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn build_output_loopback_selection(device: Device) -> Result<CaptureDeviceSelection> {
+    let device_name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
+    let supported_config = select_output_config(&device)?;
+    Ok(CaptureDeviceSelection {
+        device,
+        supported_config,
+        device_name,
+        loopback: true,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn select_output_config(device: &Device) -> Result<SupportedStreamConfig> {
+    if let Ok(config) = device.default_output_config() {
+        return Ok(config);
+    }
+
+    device
+        .supported_output_configs()
+        .context("Failed to query supported output configs")?
+        .next()
+        .map(|config| config.with_max_sample_rate())
+        .ok_or_else(|| anyhow!("The selected CPAL output device has no supported output configs"))
+}
+
+fn build_input_stream(
+    device: &Device,
+    supported_config: &SupportedStreamConfig,
+    state: CaptureState,
+    device_name: &str,
+    loopback: bool,
+) -> Result<Stream> {
+    let stream_config = supported_config.config();
+    let capture_mode = if loopback { "loopback" } else { "input" };
+
+    match supported_config.sample_format() {
+        SampleFormat::F32 => build_typed_input_stream::<f32>(
+            device,
+            &stream_config,
+            state,
+            device_name,
+            capture_mode,
+        ),
+        SampleFormat::F64 => build_typed_input_stream::<f64>(
+            device,
+            &stream_config,
+            state,
+            device_name,
+            capture_mode,
+        ),
+        SampleFormat::I8 => {
+            build_typed_input_stream::<i8>(device, &stream_config, state, device_name, capture_mode)
+        }
+        SampleFormat::I16 => build_typed_input_stream::<i16>(
+            device,
+            &stream_config,
+            state,
+            device_name,
+            capture_mode,
+        ),
+        SampleFormat::I32 => build_typed_input_stream::<i32>(
+            device,
+            &stream_config,
+            state,
+            device_name,
+            capture_mode,
+        ),
+        SampleFormat::I64 => build_typed_input_stream::<i64>(
+            device,
+            &stream_config,
+            state,
+            device_name,
+            capture_mode,
+        ),
+        SampleFormat::U8 => {
+            build_typed_input_stream::<u8>(device, &stream_config, state, device_name, capture_mode)
+        }
+        SampleFormat::U16 => build_typed_input_stream::<u16>(
+            device,
+            &stream_config,
+            state,
+            device_name,
+            capture_mode,
+        ),
+        SampleFormat::U32 => build_typed_input_stream::<u32>(
+            device,
+            &stream_config,
+            state,
+            device_name,
+            capture_mode,
+        ),
+        SampleFormat::U64 => build_typed_input_stream::<u64>(
+            device,
+            &stream_config,
+            state,
+            device_name,
+            capture_mode,
+        ),
+        other => Err(anyhow!(
+            "Unsupported CPAL input sample format for equalizer: {other:?}"
+        )),
+    }
+}
+
+fn build_typed_input_stream<T>(
+    device: &Device,
+    config: &cpal::StreamConfig,
+    mut state: CaptureState,
+    device_name: &str,
+    capture_mode: &str,
+) -> Result<Stream>
+where
+    T: Sample + SizedSample + Send + 'static,
+    f32: FromSample<T>,
+{
+    device
+        .build_input_stream(
+            config,
+            move |data: &[T], _| {
+                state.push_samples(data);
+                state.analyze();
+            },
+            handle_stream_error,
+            None,
+        )
+        .map_err(|error| {
+            let detail = format_build_stream_error(&error);
+            anyhow!(
+                "Failed to build CPAL {capture_mode} stream for device {:?} with config {} ch @ \
+                 {} Hz: {}",
+                device_name,
+                config.channels,
+                config.sample_rate.0,
+                detail
+            )
+        })
+}
+
+fn handle_stream_error(error: cpal::StreamError) {
+    warn!("Equalizer audio stream error: {error}");
+}
+
+fn format_build_stream_error(error: &cpal::BuildStreamError) -> String {
+    let raw = error.to_string();
+
+    #[cfg(target_os = "windows")]
+    if raw.contains("0x8889000A") {
+        return format!(
+            "{raw} (the Windows audio endpoint appears to be in exclusive use; disable the \
+             device's exclusive-control setting or close the app currently holding it, then try \
+             again. See the README Windows audio notes.)"
+        );
+    }
+
+    raw
 }
 
 struct CaptureState {
     shared: Arc<SharedSpectrum>,
-    format: spa::param::audio::AudioInfoRaw,
+    channels: usize,
     fft: Arc<dyn Fft<f32>>,
     scratch: Vec<Complex<f32>>,
     spectrum: Vec<Complex<f32>>,
@@ -347,13 +534,16 @@ struct CaptureState {
 }
 
 impl CaptureState {
-    fn new(shared: Arc<SharedSpectrum>, config: &EqualizerConfig) -> Self {
-        // preallocate FFT state
+    fn new(
+        shared: Arc<SharedSpectrum>,
+        config: &EqualizerConfig,
+        sample_rate: u32,
+        channels: usize,
+    ) -> Self {
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(FFT_SIZE);
         let scratch = vec![Complex::default(); fft.get_inplace_scratch_len()];
         let spectrum = vec![Complex::default(); FFT_SIZE];
-        // cosine window to cut leakage
         let window = (0..FFT_SIZE)
             .map(|index| {
                 let phase = (2.0 * std::f32::consts::PI * index as f32) / (FFT_SIZE as f32 - 1.0);
@@ -363,7 +553,7 @@ impl CaptureState {
 
         let mut state = Self {
             shared,
-            format: Default::default(),
+            channels: channels.max(1),
             fft,
             scratch,
             spectrum,
@@ -379,13 +569,11 @@ impl CaptureState {
             fall_smoothing: config.fall_smoothing,
         };
 
-        // build the initial band layout
-        state.rebuild_bands(DEFAULT_SAMPLE_RATE);
+        state.rebuild_bands(sample_rate);
         state
     }
 
     fn rebuild_bands(&mut self, sample_rate: u32) {
-        // clamp the sample rate
         let sample_rate = sample_rate.max(1);
         let nyquist = sample_rate as f32 / 2.0;
         let min_hz = self.min_frequency.min(nyquist - 1.0).max(20.0);
@@ -394,16 +582,13 @@ impl CaptureState {
         let band_count = self.band_ranges.len();
 
         for (index, band) in self.band_ranges.iter_mut().enumerate() {
-            // spread bands exponentially
             let start_hz =
                 exponential_interpolate(min_hz, max_hz, index as f32 / band_count as f32);
             let end_hz =
                 exponential_interpolate(min_hz, max_hz, (index + 1) as f32 / band_count as f32);
 
-            // convert the span into FFT bins
             let start_bin = hz_to_bin(start_hz, sample_rate).clamp(1, max_bin);
             let end_bin = if index + 1 == band_count {
-                // let the last band reach the top
                 max_bin + 1
             } else {
                 hz_to_bin(end_hz, sample_rate).clamp(start_bin + 1, max_bin + 1)
@@ -413,21 +598,19 @@ impl CaptureState {
         }
     }
 
-    fn push_samples(&mut self, bytes: &[u8]) {
-        // frames are little-endian f32 samples
-        let channels = self.format.channels().max(1) as usize;
-        let frame_bytes = channels * size_of::<f32>();
-
-        for frame in bytes.chunks_exact(frame_bytes) {
+    fn push_samples<T>(&mut self, data: &[T])
+    where
+        T: Sample,
+        f32: FromSample<T>,
+    {
+        for frame in data.chunks_exact(self.channels) {
             let mut mono = 0.0;
-            for sample in frame.chunks_exact(size_of::<f32>()) {
-                mono += f32::from_le_bytes(sample.try_into().expect("invalid sample width"));
+            for sample in frame {
+                mono += sample.to_sample::<f32>();
             }
-            // average channels down to mono
-            self.samples.push(mono / channels as f32);
+            self.samples.push(mono / self.channels as f32);
         }
 
-        // keep a bounded sample history
         let max_history = FFT_SIZE * 4;
         if self.samples.len() > max_history {
             let overflow = self.samples.len() - max_history;
@@ -436,24 +619,20 @@ impl CaptureState {
     }
 
     fn analyze(&mut self) {
-        // wait for a full window
         if self.samples.len() < FFT_SIZE {
             return;
         }
 
-        // copy the latest block into the FFT input
         let start = self.samples.len() - FFT_SIZE;
         for (slot, sample) in self.spectrum.iter_mut().zip(&self.samples[start..]) {
             slot.re = *sample;
             slot.im = 0.0;
         }
 
-        // apply the window
         for (slot, window) in self.spectrum.iter_mut().zip(&self.window) {
             slot.re *= *window;
         }
 
-        // run the FFT in place
         self.fft
             .process_with_scratch(&mut self.spectrum, &mut self.scratch);
 
@@ -461,44 +640,35 @@ impl CaptureState {
         let db_span = (self.max_db - self.min_db).max(1.0);
 
         for (index, (start_bin, end_bin)) in self.band_ranges.iter().copied().enumerate() {
-            // track the strongest bin in each band
             let mut peak = 1.0e-6_f32;
             for bin in start_bin..end_bin {
                 peak = peak.max(self.spectrum[bin].norm() * scale);
             }
 
-            // map magnitude to a display range
             let db = 20.0 * peak.log10();
             let normalized = ((db - self.min_db) / db_span).clamp(0.0, 1.0);
             let factor = if normalized > self.smoothed[index] {
-                // faster on the way up
                 self.rise_smoothing
             } else {
-                // slower on the way down
                 self.fall_smoothing
             };
-            // smooth the bar motion
             self.smoothed[index] += (normalized - self.smoothed[index]) * factor;
 
-            // publish the 8-bit bar height
             self.shared.bars[index].store(
                 (self.smoothed[index] * f32::from(u8::MAX)).round() as u8,
                 Ordering::Relaxed,
             );
         }
 
-        // mark the spectrum active
         self.shared.active.store(true, Ordering::Relaxed);
     }
 }
 
 fn exponential_interpolate(min_hz: f32, max_hz: f32, t: f32) -> f32 {
-    // logarithmic spacing favors low frequencies
     min_hz * (max_hz / min_hz).powf(t)
 }
 
 fn hz_to_bin(hz: f32, sample_rate: u32) -> usize {
-    // convert a frequency to an FFT bin
     ((hz / sample_rate as f32) * FFT_SIZE as f32).round() as usize
 }
 
@@ -511,12 +681,10 @@ pub struct Equalizer {
 impl Equalizer {
     fn render(&self) -> Result<FrameBuffer> {
         let mut buffer = FrameBuffer::new();
-        // keep the display blank until data arrives
         if !self.shared.active.load(Ordering::Relaxed) {
             return Ok(buffer);
         }
 
-        // use a small gap when it fits
         let gap = usize::from(self.bar_count <= 64);
         let usable_width = DISPLAY_WIDTH.saturating_sub(gap * self.bar_count.saturating_sub(1));
         let bar_width = (usable_width / self.bar_count).max(1);
@@ -525,14 +693,12 @@ impl Equalizer {
         let style = PrimitiveStyle::with_fill(BinaryColor::On);
 
         for (index, value) in self.shared.bars.iter().enumerate() {
-            // shared values are 0..255 heights
             let normalized = f32::from(value.load(Ordering::Relaxed)) / f32::from(u8::MAX);
             let height = (normalized * DISPLAY_HEIGHT as f32).round() as i32;
             if height <= 0 {
                 continue;
             }
 
-            // turn the height into a rectangle
             let x = left_padding + index as i32 * (bar_width + gap) as i32;
             let top = DISPLAY_HEIGHT - height;
             Rectangle::with_corners(
@@ -548,10 +714,9 @@ impl Equalizer {
 }
 
 impl ContentProvider for Equalizer {
-    type ContentStream<'a> = impl Stream<Item = Result<FrameBuffer>> + 'a;
+    type ContentStream<'a> = impl FuturesStream<Item = Result<FrameBuffer>> + 'a;
 
     fn stream(&mut self) -> Result<<Self as ContentProvider>::ContentStream<'_>> {
-        // refresh as fast as the audio polling
         let mut interval = time::interval(Duration::from_millis(self.polling_interval));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         Ok(try_stream! {

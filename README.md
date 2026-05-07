@@ -15,7 +15,7 @@ Make use of your OLED screen instead of letting the SteelSeries logo burn itself
 - Discord notifications (requires DBus)
 - Clock
 - System metrics
-- PipeWire equalizer
+- CPAL equalizer
 - Scrolling text
 - No burn-in from constantly displaying a static image
 
@@ -78,7 +78,7 @@ KERNEL=="hidraw*", ATTRS{idVendor}=="1038", ATTRS{idProduct}=="<PRODUCT ID HERE>
 
 - Install Rust **nightly** using [rustup](https://rustup.rs/)
 - Install required dependencies
-  - For Ubuntu: `sudo apt install libssl-dev libdbus-1-dev libusb-1.0-0-dev libpipewire-0.3-dev`
+  - For Ubuntu: `sudo apt install libssl-dev libdbus-1-dev libusb-1.0-0-dev libasound2-dev`
 - Clone the repository: `git clone git@github.com:not-jan/apex-tux.git`
 - Change the directory into the repository: `cd apex-tux`
 - Compile the app using the features you want
@@ -130,7 +130,8 @@ $ target/release/apex-tux
 In our case we need to set a right value for the sensor(`acpitz temp1`, critical temperatured one, i.e., cpu) and the network interface(`wlp3s0`, wifi) in the `[sysinfo]` section.
 
 You can set your default media player on the `[mpris2]` section.
-The equalizer source uses PipeWire and is configured in the `[equalizer]` section.
+The equalizer source uses CPAL and is configured in the `[equalizer]` section. On Windows, `capture_sink = true` uses the selected output device in WASAPI loopback mode. On Linux, system-output visualization still depends on the audio stack exposing a monitor or loopback source that CPAL can open as an input device.
+If Windows loopback capture fails with backend error `0x8889000A`, the selected output device is usually in exclusive use. Disable the device's exclusive-control setting in Windows Sound settings, or close the application currently holding exclusive access, then try again.
 
 
 ## Usage

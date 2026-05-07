@@ -1,6 +1,6 @@
 pub(crate) mod clock;
 
-#[cfg(all(feature = "equalizer", target_os = "linux"))]
+#[cfg(all(feature = "equalizer", any(target_os = "linux", target_os = "windows")))]
 pub(crate) mod equalizer;
 #[cfg(feature = "image")]
 pub(crate) mod image;
